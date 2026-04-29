@@ -13,7 +13,7 @@ import (
 )
 
 func TestManager_ServeHTTP_Routing(t *testing.T) {
-	manager := proxy.NewManager()
+	manager := proxy.NewManager(nil)
 
 	// 1. Setup Route Tree
 	rawNodes := []*rtree.RawNode{
@@ -78,7 +78,7 @@ func TestManager_ServeHTTP_Routing(t *testing.T) {
 }
 
 func TestManager_LoadBalancing(t *testing.T) {
-	manager := proxy.NewManager()
+	manager := proxy.NewManager(nil)
 
 	// 1. Setup Route Tree
 	rawNodes := []*rtree.RawNode{

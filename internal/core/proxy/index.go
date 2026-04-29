@@ -33,20 +33,22 @@ func (rs *responseState) Write(b []byte) (int, error) {
 }
 
 type Manager struct {
-	Tree     atomic.Pointer[rtree.RouteTree]
-	NodeLock sync.RWMutex
-	Nodes    map[string][]string
-	Indices  map[string]*uint32
+	Tree      atomic.Pointer[rtree.RouteTree]
+	NodeLock  sync.RWMutex
+	Nodes     map[string][]string
+	Indices   map[string]*uint32
+	Registry  *registry.Registry
 
 	builtinCache sync.Map // map[string]http.HandlerFunc
 	virtualCache sync.Map // map[string]http.HandlerFunc
 	Forwarder    *forwarder.Forwarder
 }
 
-func NewManager() *Manager {
+func NewManager(reg *registry.Registry) *Manager {
 	m := &Manager{
 		Nodes:     make(map[string][]string),
 		Indices:   make(map[string]*uint32),
+		Registry:  reg,
 		Forwarder: forwarder.NewForwarder(nil),
 	}
 	m.Tree.Store(&rtree.RouteTree{})
@@ -110,6 +112,11 @@ func (m *Manager) resolveBuiltinMiddleware(expr string) http.HandlerFunc {
 
 // resolveVirtualService parses and caches functional virtual service expressions.
 func (m *Manager) resolveVirtualService(expr string) http.HandlerFunc {
+	// Special case for $services which needs access to registry state
+	if expr == "$services" {
+		return virtualservices.Discovery(m.Registry.GetState())
+	}
+
 	if h, ok := m.virtualCache.Load(expr); ok {
 		return h.(http.HandlerFunc)
 	}

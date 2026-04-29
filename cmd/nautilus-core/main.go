@@ -51,7 +51,11 @@ func main() {
 	}
 
 	lc := lifecycle.New()
-	manager := proxy.NewManager()
+	
+	// 3. Initialize Registry and Watcher for dynamic node discovery
+	reg := registry.NewRegistry(servicesDir)
+
+	manager := proxy.NewManager(reg)
 
 	// 2. Initialize Config Watcher (Handles load & hot-reload)
 	cw, err := configwatcher.NewConfigWatcher(configPath, ntlcPath, manager)
@@ -62,8 +66,6 @@ func main() {
 		log.Fatalf("Failed to load initial route table: %v", err)
 	}
 
-	// 3. Initialize Registry and Watcher for dynamic node discovery
-	reg := registry.NewRegistry(servicesDir)
 	reg.Subscribe(func(serviceName string, nodes []string) {
 		log.Printf("Service nodes changed: %s -> %v", serviceName, nodes)
 		manager.UpdateServiceNodes(serviceName, nodes)

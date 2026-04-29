@@ -58,13 +58,39 @@ func Metrics(args ...string) http.HandlerFunc {
 	}
 }
 
+func Discovery(state map[string][]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, "{\n")
+		i := 0
+		for svc, nodes := range state {
+			fmt.Fprintf(w, "  \"%s\": [\n", svc)
+			for j, node := range nodes {
+				fmt.Fprintf(w, "    \"%s\"", node)
+				if j < len(nodes)-1 {
+					fmt.Fprintf(w, ",")
+				}
+				fmt.Fprintf(w, "\n")
+			}
+			fmt.Fprintf(w, "  ]")
+			if i < len(state)-1 {
+				fmt.Fprintf(w, ",")
+			}
+			fmt.Fprintf(w, "\n")
+			i++
+		}
+		fmt.Fprintf(w, "}\n")
+	}
+}
+
 // Registry maps virtual service names (with $) to their factories.
 var Registry = map[string]builtins.Factory{
-	"$echo":    Echo,
-	"$ok":      OK,
-	"$err":     ERR,
-	"$health":  OK,
-	"$metrics": Metrics,
+	"$echo":     Echo,
+	"$ok":       OK,
+	"$err":      ERR,
+	"$health":   OK,
+	"$metrics":  Metrics,
+	"$services": nil, // Placeholder for runtime resolution
 }
 
 // IsValid checks if a virtual service expression is valid.

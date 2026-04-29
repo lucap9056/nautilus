@@ -55,6 +55,18 @@ func (r *Registry) GetNodes(serviceName string) []string {
 	return slices.Clone(sn.nodes)
 }
 
+// GetState returns a snapshot of all services and their current nodes.
+func (r *Registry) GetState() map[string][]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	
+	state := make(map[string][]string)
+	for name, sn := range r.services {
+		state[name] = slices.Clone(sn.nodes)
+	}
+	return state
+}
+
 // Scan returns (changed, error)
 func (r *Registry) Scan() (bool, error) {
 	scannedState := make(map[string][]string)
