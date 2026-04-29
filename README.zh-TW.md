@@ -39,6 +39,22 @@ ntlc -i Ntlfile -o nautilus.ntl
 nautilus-core --config nautilus.ntl
 ```
 
+## 部署建議
+
+對於面向公網的部署，我們強烈建議使用 **Caddy** 作為首要進入點（上游代理）。
+
+Caddy 能與 Nautilus 完美互補，提供以下功能：
+- **自動化 TLS**：內建 ACME 支援，實現零配置的 HTTPS。
+- **埠位規範化 (Port Normalization)**：在將請求傳遞給 Nautilus 前，自動過濾 Host 標頭中的埠位後綴。
+- **UDS 原生支援**：能直接且高效地將流量轉發至 Nautilus 的進入點 Socket。
+
+`Caddyfile` 範例：
+```caddy
+example.com {
+    reverse_proxy unix//var/run/nautilus/nautilus-0.sock
+}
+```
+
 ## 技術文件
 
 *   [架構設計 (English)](docs/ARCHITECTURE.md) - 深入了解 Radix Tree 與 UDS 設計。

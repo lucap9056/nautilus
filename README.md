@@ -39,6 +39,22 @@ ntlc -i Ntlfile -o nautilus.ntl
 nautilus-core --config nautilus.ntl
 ```
 
+## Deployment Recommendation
+
+For public-facing deployments, we highly recommend using **Caddy** as the primary entrypoint (Upstream Proxy). 
+
+Caddy complements Nautilus by providing:
+- **Automatic TLS**: Built-in ACME support for zero-config HTTPS.
+- **Port Normalization**: Cleans Host headers by removing port suffixes before passing to Nautilus.
+- **UDS Native Support**: Seamlessly forwards traffic to Nautilus entrypoint sockets.
+
+Example `Caddyfile`:
+```caddy
+example.com {
+    reverse_proxy unix//var/run/nautilus/nautilus-0.sock
+}
+```
+
 ## Documentation
 
 *   [Architecture](docs/ARCHITECTURE.md) - Deep dive into Radix Trees and UDS design.
