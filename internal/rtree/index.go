@@ -2,7 +2,9 @@ package rtree
 
 import (
 	"bytes"
+	"log"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -16,10 +18,11 @@ const (
 	MethodOptions
 	MethodTrace
 	MethodPatch
-	MethodAny uint16 = 0xFFFF
+	MethodAny uint16 = 0xFFF
 )
 
-var Methods = map[string]uint16{
+// HTTPMethodMap maps standard HTTP method strings to internal bitmasks.
+var HTTPMethodMap = map[string]uint16{
 	http.MethodGet:     MethodGet,
 	http.MethodPost:    MethodPost,
 	http.MethodPut:     MethodPut,
@@ -31,202 +34,336 @@ var Methods = map[string]uint16{
 	http.MethodPatch:   MethodPatch,
 }
 
-type MiddlewarePool = map[uint32]http.HandlerFunc
+// Edge represents the transition from a parent node to a child node.
+type Edge struct {
+	Fragment []byte     // Raw fragment used during tree construction
+	Node     *RouteNode // Temporary pointer used during construction
+	TargetID uint32     // Index of the destination node in NodePool (finalized)
+	Offset   uint32     // Start position of the fragment in FragmentPool
+	End      uint32     // End position of the fragment in FragmentPool
+}
 
+// RouteTree is the primary data structure for route indexing and searching.
 type RouteTree struct {
-	Root           []*RouteNode
-	FragmentPool   []byte
-	MiddlewarePool []string
+	Root           [256]Edge   // Entry points indexed by the first character
+	FragmentPool   []byte      // Contiguous memory for all path fragments
+	MiddlewarePool []string    // Registry of middleware identifiers
+	ServicePool    []string    // Registry of service identifiers
+	NodePool       []RouteNode // Flattened node storage for cache locality
 }
 
+// RouteNode represents a specific point in the routing tree.
 type RouteNode struct {
-	fragment    []byte
-	Children    []*RouteNode
-	Middlewares []uint32
-	Service     string
-	FragOffset  uint32
-	FragEnd     uint32
-	Offset      uint16
-	End         uint16
-	Methods     uint16
-	IsWildcard  bool
-	IsLeaf      bool
+	Edges       []Edge   // Outgoing transitions
+	Middlewares []uint32 // Indices into MiddlewarePool
+	ServiceID   uint32   // Index into ServicePool
+	Methods     uint16   // Bitmask of allowed HTTP methods; 0 if not a leaf
 }
 
+// backtrackState stores information for DFS-based wildcard searching.
+type backtrackState struct {
+	edge   *Edge
+	urlIdx int
+}
+
+// Search looks up a URL in the tree and returns the matching RouteNode.
+// Returns (node, true) if found, (nil, false) otherwise.
 func (t *RouteTree) Search(url []byte) (*RouteNode, bool) {
-	currNodes := t.Root
+	if len(url) == 0 {
+		return nil, false
+	}
+
+	// Pre-allocate stack for backtracking to handle wildcards '*'
+	stack := make([]backtrackState, 0, 8)
 	urlIdx := 0
-	l := len(url)
+	urlLen := len(url)
+
+	firstChar := url[0]
+	var currentEdge *Edge
+
+	// Initial root selection
+	if t.Root[firstChar].TargetID != 0 {
+		currentEdge = &t.Root[firstChar]
+		if firstChar != '*' && t.Root['*'].TargetID != 0 {
+			stack = append(stack, backtrackState{edge: &t.Root['*'], urlIdx: 0})
+		}
+	} else if t.Root['*'].TargetID != 0 {
+		currentEdge = &t.Root['*']
+	} else {
+		return nil, false
+	}
 
 	for {
-		found := false
-		for _, node := range currNodes {
-			if node.IsWildcard {
-				if len(node.Children) > 0 {
-					child := node.Children[0]
-					targetFrag := t.FragmentPool[child.FragOffset:child.FragEnd]
+		node := &t.NodePool[currentEdge.TargetID]
+		fStart, fEnd := currentEdge.Offset, currentEdge.End
+		fLen := int(fEnd - fStart)
 
-					startSearch := urlIdx
-					foundIdx := bytes.Index(url[startSearch:], targetFrag)
-
-					if foundIdx > 0 {
-						urlIdx = startSearch + foundIdx
-						currNodes = node.Children
-						found = true
-						break
-					}
-				} else if node.IsLeaf && urlIdx < l {
+		// Handle Wildcard Fragment
+		if t.FragmentPool[fStart] == '*' {
+			if len(node.Edges) == 0 {
+				if node.Methods != 0 {
 					return node, true
 				}
+			} else {
+				// Peek next expected static fragment after wildcard
+				nextEdge := &node.Edges[0]
+				targetFrag := t.FragmentPool[nextEdge.Offset:nextEdge.End]
+
+				foundIdx := bytes.Index(url[urlIdx:], targetFrag)
+				if foundIdx >= 0 {
+					urlIdx += foundIdx
+					currentEdge = nextEdge
+					continue
+				}
+			}
+			goto ATTEMPT_BACKTRACK
+		}
+
+		// Handle Static Fragment matching
+		if urlIdx+fLen <= urlLen && bytes.Equal(url[urlIdx:urlIdx+fLen], t.FragmentPool[fStart:fEnd]) {
+			urlIdx += fLen
+
+			if urlIdx == urlLen {
+				if node.Methods != 0 {
+					return node, true
+				}
+				goto ATTEMPT_BACKTRACK
+			}
+
+			nextChar := url[urlIdx]
+			var exactMatch *Edge
+			var wildcardMatch *Edge
+
+			for i := range node.Edges {
+				e := &node.Edges[i]
+				switch t.FragmentPool[e.Offset] {
+				case nextChar:
+					exactMatch = e
+				case '*':
+					wildcardMatch = e
+				}
+			}
+
+			if exactMatch != nil {
+				if wildcardMatch != nil {
+					stack = append(stack, backtrackState{edge: wildcardMatch, urlIdx: urlIdx})
+				}
+				currentEdge = exactMatch
+				continue
+			} else if wildcardMatch != nil {
+				currentEdge = wildcardMatch
 				continue
 			}
-
-			fStart, fEnd := node.FragOffset, node.FragEnd
-			fLen := int(fEnd - fStart)
-			if urlIdx+fLen <= l && bytes.Equal(url[urlIdx:urlIdx+fLen], t.FragmentPool[fStart:fEnd]) {
-				urlIdx += fLen
-				if node.IsLeaf && urlIdx == l {
-					return node, true
-				}
-				currNodes = node.Children
-				found = true
-				break
-			}
 		}
 
-		if !found {
-			break
+	ATTEMPT_BACKTRACK:
+		if len(stack) > 0 {
+			last := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			currentEdge = last.edge
+			urlIdx = last.urlIdx
+			continue
 		}
+		break
 	}
+
 	return nil, false
 }
 
+// RawNode represents the input format for building a RouteTree.
 type RawNode struct {
 	URL         string
 	Service     string
 	Middlewares []string
-	Methods     string
+	Methods     string // Comma-separated methods, e.g., "GET,POST"
 }
 
+// Build constructs a finalized RouteTree from a slice of RawNodes.
+// Logs an error and returns nil if the input is empty.
 func Build(rawNodes []*RawNode) *RouteTree {
+	if len(rawNodes) == 0 {
+		log.Println("[rtree] Build failed: no raw nodes provided")
+		return nil
+	}
 
 	t := &RouteTree{
-		Root:         make([]*RouteNode, 0),
 		FragmentPool: make([]byte, 0),
+		NodePool:     make([]RouteNode, 0, len(rawNodes)),
 	}
 
-	middlewaresMap := make(map[string]uint32)
+	mwMap := make(map[string]uint32)
+	svcMap := make(map[string]uint32)
 
-	for _, node := range rawNodes {
-		url := ReverseHost(node.URL)
-		service := node.Service
-		methods := getMethods(node.Methods)
+	for _, raw := range rawNodes {
+		url := ReverseHost(raw.URL)
+		methodMask := parseMethods(raw.Methods)
 
-		middlewares := make([]uint32, len(node.Middlewares))
-		for i, mw := range node.Middlewares {
-			id, exists := middlewaresMap[mw]
-			if !exists {
-				id = uint32(len(t.MiddlewarePool))
-				middlewaresMap[mw] = id
-				t.MiddlewarePool = append(t.MiddlewarePool, mw)
-			}
-			middlewares[i] = id
+		svcID, exists := svcMap[raw.Service]
+		if !exists {
+			svcID = uint32(len(t.ServicePool))
+			svcMap[raw.Service] = svcID
+			t.ServicePool = append(t.ServicePool, raw.Service)
 		}
 
-		t.insert(url, service, middlewares, methods)
+		mwIDs := make([]uint32, len(raw.Middlewares))
+		for i, mw := range raw.Middlewares {
+			id, exists := mwMap[mw]
+			if !exists {
+				id = uint32(len(t.MiddlewarePool))
+				mwMap[mw] = id
+				t.MiddlewarePool = append(t.MiddlewarePool, mw)
+			}
+			mwIDs[i] = id
+		}
+
+		t.insert(url, svcID, mwIDs, methodMask)
 	}
 
-	t.compressNodes(&t.Root)
-	t.finalizePool(t.Root)
+	totalLen := t.compress()
+	t.finalize(totalLen)
 
+	log.Printf("[rtree] Successfully built tree with %d nodes", len(t.NodePool))
 	return t
 }
 
-func (t *RouteTree) insert(url []byte, service string, middlewares []uint32, methods uint16) {
-	if t.Root == nil {
-		t.Root = make([]*RouteNode, 0)
+func (t *RouteTree) insert(url []byte, svcID uint32, mws []uint32, methods uint16) {
+	if len(url) == 0 {
+		return
 	}
 
-	currNodes := &t.Root
+	firstChar := url[0]
+	edge := &t.Root[firstChar]
+	if edge.Node == nil {
+		edge.Fragment = []byte{firstChar}
+		edge.Node = &RouteNode{}
+	}
 
-	l := len(url)
-	for i := range l {
+	currNode := edge.Node
+	for i := 1; i < len(url); i++ {
 		char := url[i]
-		isWildcard := (char == '*')
-
-		var foundNode *RouteNode
-
-		for _, node := range *currNodes {
-			if isWildcard && node.IsWildcard {
-				foundNode = node
-				break
-			}
-			if !isWildcard && !node.IsWildcard && len(node.fragment) == 1 && node.fragment[0] == char {
-				foundNode = node
+		var nextEdge *Edge
+		for j := range currNode.Edges {
+			if currNode.Edges[j].Fragment[0] == char {
+				nextEdge = &currNode.Edges[j]
 				break
 			}
 		}
 
-		if foundNode == nil {
-			foundNode = &RouteNode{
-				fragment:   []byte{char},
-				IsWildcard: isWildcard,
-				Offset:     uint16(i),
-				End:        uint16(i + 1),
-			}
-			*currNodes = append(*currNodes, foundNode)
+		if nextEdge == nil {
+			currNode.Edges = append(currNode.Edges, Edge{
+				Node:     &RouteNode{},
+				Fragment: []byte{char},
+			})
+			nextEdge = &currNode.Edges[len(currNode.Edges)-1]
 		}
+		currNode = nextEdge.Node
+	}
 
-		if i == l-1 {
-			foundNode.IsLeaf = true
-			foundNode.Service = service
-			foundNode.Middlewares = middlewares
-			foundNode.Methods = methods
+	currNode.ServiceID = svcID
+	currNode.Middlewares = mws
+	currNode.Methods = methods
+}
+
+// compress merges single-child nodes to form a radix tree.
+func (t *RouteTree) compress() int {
+	totalLen := 0
+	for i := range 256 {
+		if t.Root[i].Node != nil {
+			totalLen += t.compressNode(t.Root[i].Node)
+		}
+	}
+	return totalLen
+}
+
+func (t *RouteTree) compressEdge(e *Edge) (*Edge, int, bool) {
+	if e.Node == nil {
+		return nil, 0, false
+	}
+
+	switch len(e.Node.Edges) {
+	case 0:
+		if e.Fragment[0] != '*' {
+			return e, 1, true
+		}
+	case 1:
+		child, l, ok := t.compressEdge(&e.Node.Edges[0])
+		if ok && e.Fragment[0] != '*' && e.Node.Methods == 0 {
+			e.Fragment = append(e.Fragment, child.Fragment...)
+			e.Node = child.Node
+			return e, (l + 1), true
 		} else {
-			currNodes = &foundNode.Children
+			return nil, (l + 1), false
+		}
+	default:
+		l := t.compressNode(e.Node)
+		return nil, (l + 1), false
+	}
+	return nil, 1, false
+}
+
+func (t *RouteTree) compressNode(n *RouteNode) int {
+	total := 0
+	wildcardIdx := -1
+	for i := range n.Edges {
+		_, l, _ := t.compressEdge(&n.Edges[i])
+		total += l
+		if n.Edges[i].Fragment[0] == '*' {
+			wildcardIdx = i
+		}
+	}
+	// Ensure wildcard is always the last edge for searching priority
+	if wildcardIdx > -1 {
+		last := len(n.Edges) - 1
+		n.Edges[wildcardIdx], n.Edges[last] = n.Edges[last], n.Edges[wildcardIdx]
+	}
+	return total
+}
+
+func (t *RouteTree) finalize(estimatedLen int) {
+	t.NodePool = make([]RouteNode, 1) // 0 index is reserved/null
+	t.FragmentPool = make([]byte, 0, estimatedLen)
+
+	for i := range 256 {
+		if t.Root[i].Node != nil {
+			t.Root[i] = t.rebuildPool(&t.Root[i])
 		}
 	}
 }
 
-func (t *RouteTree) compressNodes(nodes *[]*RouteNode) {
-	for _, node := range *nodes {
-		if len(node.Children) > 0 {
-			t.compressNodes(&node.Children)
-		}
+func (t *RouteTree) rebuildPool(e *Edge) Edge {
+	edges := make([]Edge, len(e.Node.Edges))
+	for i := range edges {
+		edges[i] = t.rebuildPool(&e.Node.Edges[i])
+	}
 
-		for len(node.Children) == 1 && !node.IsLeaf && !node.IsWildcard && !node.Children[0].IsWildcard {
-			child := node.Children[0]
+	offset := uint32(len(t.FragmentPool))
+	t.FragmentPool = append(t.FragmentPool, e.Fragment...)
+	end := uint32(len(t.FragmentPool))
 
-			isNodeHost := node.Offset > node.End
-			isChildHost := child.Offset > child.End
-			if isNodeHost != isChildHost {
-				break
-			}
+	nodeID := uint32(len(t.NodePool))
+	t.NodePool = append(t.NodePool, RouteNode{
+		Edges:       edges,
+		Middlewares: e.Node.Middlewares,
+		ServiceID:   e.Node.ServiceID,
+		Methods:     e.Node.Methods,
+	})
 
-			node.fragment = append(node.fragment, child.fragment...)
-			node.End = child.End
-
-			node.IsLeaf = child.IsLeaf
-			node.Service = child.Service
-			node.Methods = child.Methods
-			node.Middlewares = child.Middlewares
-
-			node.Children = child.Children
-		}
+	return Edge{
+		TargetID: nodeID,
+		Offset:   offset,
+		End:      end,
 	}
 }
 
-func getMethods(methods string) uint16 {
+func parseMethods(methods string) uint16 {
 	var res uint16
-
-	for method := range strings.SplitSeq(strings.ToLower(methods), ",") {
-		res |= getMethod(method)
+	for m := range strings.SplitSeq(strings.ToLower(methods), ",") {
+		res |= matchMethodToken(strings.TrimSpace(m))
 	}
-
 	return res
 }
 
-func getMethod(m string) uint16 {
+func matchMethodToken(m string) uint16 {
 	switch m {
 	case "g", "get":
 		return MethodGet
@@ -249,32 +386,27 @@ func getMethod(m string) uint16 {
 	case "*", "any":
 		return MethodAny
 	default:
+		if m != "" {
+			log.Printf("[rtree] Warning: unknown HTTP method token ignored: %s", m)
+		}
 		return 0
 	}
 }
 
-func (t *RouteTree) finalizePool(nodes []*RouteNode) {
-	for _, node := range nodes {
-		node.FragOffset = uint32(len(t.FragmentPool))
-		t.FragmentPool = append(t.FragmentPool, node.fragment...)
-		node.FragEnd = uint32(len(t.FragmentPool))
-
-		node.fragment = nil
-
-		if len(node.Children) > 0 {
-			t.finalizePool(node.Children)
-		}
-	}
-}
-
+// ReverseHost reverses the host part of the URL for better indexing (e.g., com.google.www)
 func ReverseHost(rawURL string) []byte {
 	url := []byte(rawURL)
-	slash := bytes.Index(url, []byte("/"))
-	if slash == -1 {
-		slash = len(url)
+	slashIdx := slices.Index(url, '/')
+	if slashIdx == -1 {
+		slashIdx = len(url)
+		url = append(url, '/')
 	}
-	for i := range slash / 2 {
-		url[i], url[slash-1-i] = url[slash-1-i], url[i]
+	if slashIdx <= 1 {
+		return url
+	}
+	// Reverse only the segment before the first slash
+	for i := 0; i < slashIdx/2; i++ {
+		url[i], url[slashIdx-1-i] = url[slashIdx-1-i], url[i]
 	}
 	return url
 }
