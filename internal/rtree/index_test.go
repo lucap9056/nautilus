@@ -151,9 +151,9 @@ func TestReverseHost(t *testing.T) {
 		input    string
 		expected string
 	}{
-		{"example.com/api", "moc.elpmaxe/api"},
+		{"example.com/api", "com.example/api"},
 		{"a.b.c/path", "c.b.a/path"},
-		{"localhost/v1", "tsohlacol/v1"},
+		{"localhost/v1", "localhost/v1"},
 		{"/no-host", "/no-host"},
 		{"*/", "*/"},
 		{"*/health", "*/health"},
