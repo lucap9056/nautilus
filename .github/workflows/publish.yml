@@ -30,7 +30,7 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/nautilus
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},strip_v=true
             type=raw,value=latest
 
       - name: Build and Push Nautilus
